@@ -9,27 +9,11 @@
  * `./src/main.js` using webpack. This gives us some performance wins.
  */
 import path from 'path';
-import { app, BrowserWindow, shell, ipcMain } from 'electron';
-import { autoUpdater } from 'electron-updater';
-import log from 'electron-log';
-import MenuBuilder from './menu';
+import { app, BrowserWindow, ipcMain, dialog, Menu, shell } from 'electron';
 import { resolveHtmlPath } from './util';
 
-class AppUpdater {
-  constructor() {
-    log.transports.file.level = 'info';
-    autoUpdater.logger = log;
-    autoUpdater.checkForUpdatesAndNotify();
-  }
-}
-
 let mainWindow: BrowserWindow | null = null;
-
-ipcMain.on('ipc-example', async (event, arg) => {
-  const msgTemplate = (pingPong: string) => `IPC test: ${pingPong}`;
-  console.log(msgTemplate(arg));
-  event.reply('ipc-example', msgTemplate('pong'));
-});
+let splashScreen: BrowserWindow | null = null;
 
 if (process.env.NODE_ENV === 'production') {
   const sourceMapSupport = require('source-map-support');
@@ -56,18 +40,18 @@ const installExtensions = async () => {
     .catch(console.log);
 };
 
+const RESOURCES_PATH = app.isPackaged
+  ? path.join(process.resourcesPath, 'assets')
+  : path.join(__dirname, '../../assets');
+
+const getAssetPath = (...paths: string[]): string => {
+  return path.join(RESOURCES_PATH, ...paths);
+};
+
 const createWindow = async () => {
   if (isDebug) {
     await installExtensions();
   }
-
-  const RESOURCES_PATH = app.isPackaged
-    ? path.join(process.resourcesPath, 'assets')
-    : path.join(__dirname, '../../assets');
-
-  const getAssetPath = (...paths: string[]): string => {
-    return path.join(RESOURCES_PATH, ...paths);
-  };
 
   mainWindow = new BrowserWindow({
     show: false,
@@ -81,40 +65,108 @@ const createWindow = async () => {
     },
   });
 
-  mainWindow.loadURL(resolveHtmlPath('index.html'));
+  mainWindow.webContents.once('did-finish-load', () => {
+    // The port is returned by a function on the original code.
+    mainWindow?.webContents.send('set-server-port', 1234);
+  });
 
   mainWindow.on('ready-to-show', () => {
+    splashScreen?.destroy();
     if (!mainWindow) {
       throw new Error('"mainWindow" is not defined');
     }
-    if (process.env.START_MINIMIZED) {
-      mainWindow.minimize();
-    } else {
-      mainWindow.show();
-    }
+
+    mainWindow.minimize();
   });
 
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
 
-  const menuBuilder = new MenuBuilder(mainWindow);
-  menuBuilder.buildMenu();
+  await mainWindow.loadURL(resolveHtmlPath('index.html'));
+};
 
-  // Open urls in the user's browser
-  mainWindow.webContents.setWindowOpenHandler((edata) => {
-    shell.openExternal(edata.url);
-    return { action: 'deny' };
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+// Fake for this test project
+async function executeBackend(): Promise<[boolean, string]> {
+  await sleep(3000);
+  return [true, ''];
+}
+
+function menuTemplateFactory(window: BrowserWindow) {
+  return [
+    {
+      label: 'File',
+      submenu: [
+        {
+          label: 'Open EcuExtract File',
+          accelerator: 'CmdOrCtrl+O',
+          click: () => {
+            window.webContents.send('open-file', 1);
+          },
+        },
+      ],
+    },
+  ];
+}
+
+async function createSplashWindow() {
+  splashScreen = new BrowserWindow({
+    width: 1024,
+    height: 300,
+    transparent: true,
+    frame: false,
+    show: false,
+    icon: getAssetPath('images/icon.ico'),
   });
 
-  // Remove this if your app does not use auto updates
-  // eslint-disable-next-line
-  new AppUpdater();
-};
+  splashScreen.once('ready-to-show', async () => {
+    splashScreen!.center();
+    splashScreen!.show();
+    const [backendStarted, message] = await executeBackend();
+    if (!backendStarted) {
+      await dialog.showMessageBox({ message });
+      app.quit();
+      return;
+    }
+
+    await createWindow();
+    const menuTemplate = menuTemplateFactory(mainWindow!);
+    const menu = Menu.buildFromTemplate(menuTemplate);
+    Menu.setApplicationMenu(menu);
+  });
+
+  const splashPath = getAssetPath('icon.png');
+  await splashScreen.loadFile(splashPath);
+}
+
+// Fake for this test project
+function getServerPort() {
+  return 1234;
+}
 
 /**
  * Add event listeners...
  */
+
+app.on('ready', async () => {
+  await createSplashWindow();
+  ipcMain.handle('get-server-port', () => getServerPort());
+  ipcMain.on('show-item-in-folder', (event, item) => {
+    shell.showItemInFolder(item);
+  });
+  ipcMain.on('shell.open-external', (event, url) => {
+    shell.openExternal(url);
+  });
+  ipcMain.on('show-alert', (event, msg) => {
+    dialog.showMessageBox({ title: app.getName(), message: msg });
+  });
+});
 
 app.on('window-all-closed', () => {
   // Respect the OSX convention of having the application in memory even
@@ -124,14 +176,14 @@ app.on('window-all-closed', () => {
   }
 });
 
-app
-  .whenReady()
-  .then(() => {
-    createWindow();
-    app.on('activate', () => {
-      // On macOS it's common to re-create a window in the app when the
-      // dock icon is clicked and there are no other windows open.
-      if (mainWindow === null) createWindow();
-    });
-  })
-  .catch(console.log);
+app.on('activate', async () => {
+  if (!mainWindow) {
+    const [backendStarted, message] = await executeBackend();
+    if (!backendStarted) {
+      dialog.showMessageBoxSync({ message });
+      app.quit();
+      return;
+    }
+    await createWindow();
+  }
+});
